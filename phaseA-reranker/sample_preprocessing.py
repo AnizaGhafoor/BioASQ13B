@@ -1,0 +1,115 @@
+
+
+from typing import Any
+
+
+class BasicSamplePreprocessing:
+    def __init__(self, tokenizer, model_max_length=-1) -> None:
+        self.tokenizer = tokenizer
+        self.model_max_length = model_max_length if model_max_length != -1 else tokenizer.model_max_length
+        
+    def __call__(self, sample) -> Any:
+        
+        if "label" in sample:
+            # training
+            inputs = self.tokenizer(sample["query_text"], sample["doc_text"])
+            
+            # skip sample if too big during training
+            if len(inputs.input_ids) > self.model_max_length:
+                return None
+            
+            return inputs | {"label_ids": int(sample["label"])}
+        else:
+            # inference
+            inputs = self.tokenizer(sample["query_text"], sample["doc_text"], truncation=True, max_length=self.model_max_length)
+            
+            return inputs | {"id": sample["id"], "doc_id": sample["doc_id"]}
+        
+
+from typing import Any
+from sample_preprocessing import BasicSamplePreprocessing
+import re
+import math
+
+def split_sentence(sentence, n_parts):
+    words = sentence.split()
+    part_length = len(words) // n_parts  # Number of words in each part
+    remainder = len(words) % n_parts     # Remainder to distribute one extra word as needed
+
+    parts = []
+    current_index = 0
+
+    for i in range(n_parts):
+        # Calculate the end index for this part, adding an extra word if needed
+        extra_word = 1 if i < remainder else 0
+        next_index = current_index + part_length + extra_word
+
+        # Join words to form a part and add it to the result list
+        part = " ".join(words[current_index:next_index])
+        parts.append(part)
+        
+        # Update current index to the start of the next part
+        current_index = next_index
+
+    return parts
+
+import time
+import nltk
+
+class SentencePreprocessing(BasicSamplePreprocessing):
+    def __init__(self, tokenizer, model_max_length=-1, sentence_length=128) -> None:
+        super().__init__(tokenizer = tokenizer, model_max_length = model_max_length)
+        self.sentence_length = sentence_length
+
+        
+    def __call__(self, sample) -> Any:
+        #st = time.time()
+        _sentences = nltk.sent_tokenize(sample["doc_text"])
+        #print("ntlk", time.time()-st)
+        #st = time.time()
+        _tokenized_sentences = self.tokenizer(_sentences, add_special_tokens=False).input_ids
+        tokenized_question = self.tokenizer(sample["query_text"], add_special_tokens=False).input_ids
+
+        sentences = []
+        tokenized_sentences = []
+        
+        for i,tok_sent in enumerate(_tokenized_sentences):
+            if len(tok_sent) + len(tokenized_question) + 3 <= self.sentence_length:
+                sentences.append(_sentences[i])
+                tokenized_sentences.append(tok_sent)
+            else:
+                
+                number_chuncks = round(len(tok_sent) + len(tokenized_question) + 3 / self.sentence_length) + 1
+                for sent in split_sentence(_sentences[i], number_chuncks):
+                    sentences.append(sent)
+                    tokenized_sentences.append(self.tokenizer(sent, add_special_tokens=False).input_ids)
+                    
+        #sentences = _sentences
+        #tokenized_sentences = _tokenized_sentences
+        
+        paragraphs = []
+        paragraph = self.tokenizer.cls_token + sample["query_text"] + self.tokenizer.sep_token
+        num_tokens = len(tokenized_question) + 2
+        for i in range(len(sentences)):
+            sen = sentences[i]
+            #print(num_tokens, paragraph)
+            #print(len(tokenized_sentences[i]), len(self.tokenizer(paragraph, add_special_tokens=False).input_ids))
+            if len(tokenized_sentences[i])+num_tokens + 1 > self.sentence_length :
+                #print("finish")
+                paragraphs.append(paragraph + self.tokenizer.sep_token)
+                paragraph = self.tokenizer.cls_token + sample["query_text"] + self.tokenizer.sep_token + sen
+                num_tokens = len(tokenized_question) + len(tokenized_sentences[i]) + 2
+            else:
+                #print("concat")
+                paragraph += " " + sen
+                num_tokens += len(tokenized_sentences[i])
+
+        paragraphs.append(paragraph)
+
+        inputs = self.tokenizer(paragraphs, add_special_tokens=False)
+        #inputs = {}
+        #print("all",time.time()-st)
+        if "label" in sample:
+            return inputs | {"label_ids": int(sample["label"])}
+        else:
+            return inputs | {"id": sample["id"], "doc_id": sample["doc_id"]}

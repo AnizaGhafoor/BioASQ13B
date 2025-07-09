@@ -1,0 +1,30 @@
+Running for model: Nemotron
+Number of promtps: 765
+Loading model...
+[WARNING] gemm_config.in is not found; using default GEMM algo
+Model loaded. Running inference...
+Failed to find a feasible kernel in the cache, will dispatch by heuristic.
+Failed to find a feasible kernel in the cache, will dispatch by heuristic.
+Failed to find a feasible kernel in the cache, will dispatch by heuristic.
+Failed to find a feasible kernel in the cache, will dispatch by heuristic.
+Response generated in 5307.89 seconds
+Total tokens: 198108, Tokens per sec: 37.32
+Total questions: 765, Avg answer length: 258.96, qpd: 12452.409449022281
+Results saved in /data/bioasq13/outputs/Batch04/runs_ap/initial_gen
+Model used: Nemotron
+Completed: Nemotron
+Running for model: OpenBioLLM
+Number of promtps: 765
+Loading model...
+[WARNING] gemm_config.in is not found; using default GEMM algo
+Model loaded. Running inference...
+2025-05-07 23:05:37,012 - lmdeploy - [31mERROR[0m - async_engine.py:544 - Truncate max_new_tokens to 805
+2025-05-07 23:05:37,032 - lmdeploy - [31mERROR[0m - async_engine.py:544 - Truncate max_new_tokens to 698
+2025-05-07 23:05:37,054 - lmdeploy - [31mERROR[0m - async_engine.py:544 - Truncate max_new_tokens to 652
+Response generated in 4579.61 seconds
+Total tokens: 97898, Tokens per sec: 21.38
+Total questions: 765, Avg answer length: 127.97, qpd: 14432.675401282953
+Results saved in /data/bioasq13/outputs/Batch04/runs_ap/initial_gen
+Model used: OpenBioLLM
+Completed: OpenBioLLM
+All models processed!

@@ -1,0 +1,60 @@
+Running for model: Nemotron
+[WARNING] gemm_config.in is not found; using default GEMM algo
+Number of promtps: 85
+Loading model...
+Model loaded. Running inference...
+Response generated in 181.86 seconds
+Total tokens: 29779, Tokens per sec: 163.74
+Total questions: 85, Avg answer length: 350.34, qpd: 40381.926412017645
+Results saved in /data/bioasq13/outputs/Batch04/runs_ap/summaries
+Model used: Nemotron
+Completed: Nemotron
+Running for model: Nemotron
+[WARNING] gemm_config.in is not found; using default GEMM algo
+Number of promtps: 85
+Loading model...
+Model loaded. Running inference...
+Response generated in 184.78 seconds
+Total tokens: 29724, Tokens per sec: 160.87
+Total questions: 85, Avg answer length: 349.69, qpd: 39745.595793366134
+Results saved in /data/bioasq13/outputs/Batch04/runs_ap/summaries
+Model used: Nemotron
+Completed: Nemotron
+Running for model: Nemotron
+[WARNING] gemm_config.in is not found; using default GEMM algo
+Number of promtps: 85
+Loading model...
+Model loaded. Running inference...
+Response generated in 329.86 seconds
+invalid, regeneratin 2 67cde43c81b102733300001e 6
+invalid, regeneratin 2 67cde43c81b102733300001e 6
+reached try conuter
+invalid, regeneratin 2 67d7208218b1e36f2e00002e 10
+invalid, regeneratin 2 67d7208218b1e36f2e00002e 10
+reached try conuter
+invalid, regeneratin 2 67d7fded18b1e36f2e000042 11
+invalid, regeneratin 2 67d7fded18b1e36f2e000042 11
+reached try conuter
+invalid, regeneratin 2 67e285b018b1e36f2e00007b 18
+invalid, regeneratin 2 67e285b018b1e36f2e00007b 18
+reached try conuter
+invalid, regeneratin 2 67fbe21818b1e36f2e000113 38
+invalid, regeneratin 2 67fd922518b1e36f2e000143 46
+invalid, regeneratin 2 67fd922518b1e36f2e000143 46
+reached try conuter
+invalid, regeneratin 2 680a081d18b1e36f2e00014c 55
+invalid, regeneratin 2 680a081d18b1e36f2e00014c 55
+reached try conuter
+invalid, regeneratin 2 680bc74618b1e36f2e000155 63
+invalid, regeneratin 2 680bc74618b1e36f2e000155 63
+reached try conuter
+invalid, regeneratin 2 680f4c63353a4a2e6b00000d 73
+invalid, regeneratin 2 680f4c63353a4a2e6b00000d 73
+reached try conuter
+invalid, regeneratin 2 6810daad353a4a2e6b000013 79
+Total tokens: 33970, Tokens per sec: 102.98
+Total questions: 85, Avg answer length: 399.65, qpd: 22264.15866538538
+Results saved in /data/bioasq13/outputs/Batch04/runs_ap/summaries
+Model used: Nemotron
+Completed: Nemotron
+All models processed!
