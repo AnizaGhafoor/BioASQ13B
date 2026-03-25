@@ -17,7 +17,6 @@ This repository contains the code for our submission to the **BioASQ Challenge 1
 
 Our pipeline processes a question in sequential phases to arrive at the final answer.
 
-![System Architecture Diagram]([path/to/your/diagram.png])  <!-- It's highly recommended to create a simple diagram in a tool like draw.io and add it here -->
 
 **1. BM25 Indexing & Search (`phaseA-BM25`):**
    - A searchable index of the biomedical literature is created.
@@ -35,16 +34,7 @@ Our pipeline processes a question in sequential phases to arrive at the final an
 
 ## Performance
 
-<!-- Fill this in with your best scores on the development or test set -->
-Our model achieves the following results on the official BioASQ 13b development set:
-
-| Question Type | Metric      | Score      |
-|---------------|-------------|------------|
-| Factoid       | Accuracy    | **[0.XX]** |
-|               | MRR         | **[0.XX]** |
-| List          | F1-Score    | **[0.XX]** |
-| Yes/No        | Accuracy    | **[0.XX]** |
-
+Pending.
 ---
 
 ## Setup and Installation
@@ -54,19 +44,18 @@ Follow these steps to set up the environment and prepare the necessary data and 
 ### 1. Prerequisites
 *   Python 3.9+
 *   A system with sufficient RAM and a modern NVIDIA GPU (for the reranker and generation phases).
-*   ~[XX] GB of disk space.
 
 ### 2. Clone the Repository
 ```sh
-git clone [your-github-repo-link]
-cd [your-repo-name]
+git clone https://github.com/bioinformatics-ua/BioASQ13B
+cd BioASQ13B
 ```
 
 ### 3. Install Dependencies
 Create and activate a virtual environment, then install the required packages.
 ```sh
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate 
 pip install -r requirements.txt
 ```
 
@@ -80,7 +69,7 @@ python data/baselines/download_baselines.py
 python phaseA-BM25/create_indexes.py --path [path/to/bioasq/corpus]
 
 # Download our fine-tuned models (if you're hosting them)
-# [Add instructions here, e.g., using wget, git-lfs, or manual download from a drive]
+# available on huggingface, support is still coming
 ```
 
 ---
@@ -146,9 +135,3 @@ A brief overview of the key directories in this project.
 ## License
 
 Distributed under the [MIT License]. See `LICENSE.txt` for more information.
-
-## Contact
-
-[Your Name / Team Name] - [@YourTwitter(optional)] - [your_email@domain.com]
-
-Project Link: [https://github.com/your_username/your_repository](https://github.com/your_username/your_repository)
