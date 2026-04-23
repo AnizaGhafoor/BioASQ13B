@@ -1,3 +1,9 @@
+data/full_input/
+data/indexes/
+phaseA-BM25/__pycache__/
+phaseA-BM25/results/
+pubmed_xmls/
+
 data/pubmed_baseline_2025.jsonl
 data/ids_per_baseline_2025.p
 
