@@ -1,88 +1,182 @@
-import pyterrier as pt
-if not pt.started():
-  pt.init()
-import pandas as pd
+import os
+import sys
 import json
+import time
 
-from grid_search import load_index, get_queries, write_results
-import click
+from pyserini.search.lucene import LuceneSearcher
 
-def add_content(baseline, docs):
-    
-    def get_file_path(baseline):
-        return "../../data/baselines/pubmed_baseline_"+ str(baseline) +".jsonl"
-    
-    def load_content(baseline, lst_docs):
-        docs_set = set(lst_docs)
-        total = len(docs_set)
-        doc_content = {}
-        
-        with open(get_file_path(baseline), "r") as f:
-            for line in f:
-                doc = json.loads(line)
-                if doc['pmid'] in docs_set:
-                    doc_content[doc['pmid']] = " ".join([doc["title"], doc["abstract"]])
-                    docs_set.remove( doc['pmid'] )
-                    print(f"{total - len(docs_set)}/{total}", end="\r")
-                    
-                    if len(doc_content) == total: break
-                    
-        print(f"{baseline} done")
-        return doc_content
-        
-    lst_docs = [ doc["id"] for qid, neg_docs in docs.items() for doc in neg_docs ]
-    
-    doc_content = load_content(baseline, lst_docs)
 
-    for qid, neg_docs in docs.items(): 
-        neg_docs_wContent = []
-        for doc in neg_docs:
-            pid = doc["id"]
-            text = {"text": doc_content[pid]}
+# ══════════════════════════════════════════════════════════════════ #
+#  CONFIGURE — change these paths to match your setup              #
+# ══════════════════════════════════════════════════════════════════ #
 
-            neg_docs_wContent.append( {**doc, **text} )
+BASE_DIR     = r"C:\projects\BioASQ13B"
+FULL_INDEX   = os.path.join(BASE_DIR, "data", "indexes", "pyserini_pubmed_full")
+QUERIES_PATH = os.path.join(BASE_DIR, "data", "training", "trainining14b.json")
 
-        docs[qid] = neg_docs_wContent
+OUTPUT_FILE  = os.path.join(BASE_DIR, "phaseA-BM25", "results", "bm25_results.jsonl")
 
-    return docs
+# BM25 params — best values from grid search
+K1 = 0.6
+B  = 0.3
 
-@click.command()
-@click.argument("queries_path")
-@click.argument("output_file")
-def main(queries_path, output_file):
-    """ main """
-    # best bm25 params based on the grid search results (see more in analyze_grid_search.py)
-    k1 = 0.4
-    b  = 0.3
-    
-    #queries_path = "../../data/training/training12b_inflated_wContents_IA_complete.jsonl"
-    queries, qrels_dict, queryid2text = get_queries( queries_path )   # get list of queries for each baseline
-    
-    #f"../results/hard_negatives_IA_complete.jsonl"
-    with open(output_file, "w") as f:
-        for baseline, query_list in queries.items():   # ["what ...". "how ..."]
+# How many docs to retrieve per query
+NUM_RESULTS = 1000
 
-            index = load_index( baseline )
-            print(f">> baseline {baseline} (k1: {k1}, b: {b})\n")  
-                
-            bm25 = index.bm25(k1=k1, b=b, num_results=1000, threads=32) 
-                            
-            questions_dataframe = pd.DataFrame([ query for query in query_list ])
+# ══════════════════════════════════════════════════════════════════ #
 
-            results = { qid: [ {"id": row["docno"], "score": row["score"]} for _, row in results.iterrows() ] 
-                        for qid, results in bm25.transform( questions_dataframe ).groupby('qid') }
-        
 
-            # write_results(baseline, results, results_path="../results/search/") 
+# ------------------------------------------------------------------ #
+#  STEP 1 — Load Pyserini index                                     #
+# ------------------------------------------------------------------ #
 
-            bm25_rank = { qid : [ doc for doc in res if doc["id"]] for qid, res in results.items() }
+def load_index(index_path: str) -> LuceneSearcher:
+    if not os.path.exists(index_path):
+        print(f"[STOP] Index not found at: {index_path}")
+        sys.exit(1)
 
-            bm25_wContent = add_content(baseline, bm25_rank)
+    searcher = LuceneSearcher(index_path)
+    searcher.set_bm25(k1=K1, b=B)
+    print(f"[OK] Index loaded from: {index_path}")
+    print(f"     BM25 params — k1={K1}, b={B}, num_results={NUM_RESULTS}\n")
+    return searcher
 
-            for qid, bm25_r in bm25_wContent.items():
-                out = { "id": qid, "query_text": queryid2text[qid], "bm25": bm25_r } 
-                f.write(f"{json.dumps(out)}\n")
-            
+
+# ------------------------------------------------------------------ #
+#  STEP 2 — Load queries                                            #
+# ------------------------------------------------------------------ #
+
+def get_queries(queries_path: str):
+    if not os.path.exists(queries_path):
+        print(f"[STOP] Queries file not found: {queries_path}")
+        sys.exit(1)
+
+    queries      = []
+    qrels_dict   = {}
+    queryid2text = {}
+
+    with open(queries_path, "r", encoding="utf-8") as f:
+        raw = f.read().strip()
+
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "questions" in data:
+            question_list = data["questions"]
+            print(f"[INFO] Detected standard BioASQ JSON format.")
+        elif isinstance(data, list):
+            question_list = data
+            print(f"[INFO] Detected JSON array format.")
+        else:
+            question_list = [data]
+    except json.JSONDecodeError:
+        question_list = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line:
+                question_list.append(json.loads(line))
+        print(f"[INFO] Detected JSONL format.")
+
+    for item in question_list:
+        qid  = str(item["id"])
+        text = item.get("body", item.get("query_text", item.get("question", "")))
+
+        queries.append({"qid": qid, "query": text})
+        queryid2text[qid] = text
+
+        gold = set()
+        for doc_url in item.get("documents", []):
+            pmid = str(doc_url).rstrip("/").split("/")[-1]
+            gold.add(pmid)
+        qrels_dict[qid] = gold
+
+    print(f"[OK] Loaded {len(queries):,} queries from: {queries_path}\n")
+    return queries, qrels_dict, queryid2text
+
+
+# ------------------------------------------------------------------ #
+#  STEP 3 — Run BM25 search                                         #
+# ------------------------------------------------------------------ #
+
+def run_search(searcher: LuceneSearcher, queries: list) -> dict:
+    results = {}
+    total   = len(queries)
+    t0      = time.time()
+
+    for i, q in enumerate(queries, 1):
+        qid       = q["qid"]
+        query_txt = q["query"]
+
+        hits = searcher.search(query_txt, k=NUM_RESULTS)
+
+        docs = []
+        for hit in hits:
+            try:
+                raw      = searcher.doc(hit.docid).raw()   # fixed for newer Pyserini
+                doc_json = json.loads(raw)
+                contents = doc_json.get("contents", "")
+            except Exception:
+                contents = ""
+
+            docs.append({
+                "id":       hit.docid,
+                "score":    round(float(hit.score), 6),
+                "contents": contents,
+            })
+
+        results[qid] = docs
+
+        if i % 50 == 0 or i == total:
+            elapsed = time.time() - t0
+            print(f"  Searched {i:>5}/{total}  ({elapsed:.0f}s)", flush=True)
+
+    print(f"\n[OK] Search complete — {total:,} queries in {time.time()-t0:.0f}s\n")
+    return results
+
+
+# ------------------------------------------------------------------ #
+#  STEP 4 — Write output JSONL                                      #
+# ------------------------------------------------------------------ #
+
+def write_output(results: dict, queryid2text: dict, output_file: str):
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+
+    written = 0
+    with open(output_file, "w", encoding="utf-8") as f:
+        for qid, docs in results.items():
+            out = {
+                "id":         qid,
+                "query_text": queryid2text.get(qid, ""),
+                "bm25":       docs,
+            }
+            f.write(json.dumps(out) + "\n")
+            written += 1
+
+    print(f"[OK] Results written: {written:,} queries -> {output_file}\n")
+
+
+# ══════════════════════════════════════════════════════════════════ #
+#  MAIN — no arguments needed, paths are hardcoded above           #
+# ══════════════════════════════════════════════════════════════════ #
+
+def main():
+    print("=" * 55)
+    print("  PYSERINI BM25 SEARCH")
+    print(f"  Index      : {FULL_INDEX}")
+    print(f"  Queries    : {QUERIES_PATH}")
+    print(f"  Output     : {OUTPUT_FILE}")
+    print(f"  BM25       : k1={K1}  b={B}  top={NUM_RESULTS}")
+    print("=" * 55 + "\n")
+
+    searcher                     = load_index(FULL_INDEX)
+    queries, qrels_dict, id2text = get_queries(QUERIES_PATH)
+    results                      = run_search(searcher, queries)
+    write_output(results, id2text, OUTPUT_FILE)
+
+    print("=" * 55)
+    print("  SEARCH DONE")
+    print(f"  Output -> {OUTPUT_FILE}")
+    print("=" * 55)
+
 
 if __name__ == "__main__":
     main()
