@@ -1,0 +1,5 @@
+"Run on terminal for JAVA SDK"
+$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot"                                                     
+$env:PATH = "C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot\bin;$env:PATH"
+$env:JPYPE_JVM_DLL = "C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot\bin\server\jvm.dll"
+$env:JAVA_TOOL_OPTIONS = "-Xmx5g"
