@@ -2,22 +2,36 @@
 hybrid_search.py
 ----------------
 Hybrid retrieval fusing 2 signals with Reciprocal Rank Fusion (RRF):
-    1. BM25        — keyword match     (your existing Pyserini index)
-    2. MedCPT dense — semantic meaning  (dense_medcpt/medcpt.faiss)
+    1. BM25          — keyword / lexical match  (Pyserini index)
+    2. BiomedBERT    — biomedical semantic match (dense_biomedbert/biomedbert.faiss)
 
-MedCPT (ncbi/MedCPT-Query-Encoder) is trained by NCBI on 255M PubMed
-search logs — best biomedical retrieval model for PubMed at 109M params.
+WHY BiomedBERT over MedCPT for query encoding?
+  - MedCPT uses SEPARATE query + article encoders that must be matched.
+    Using MedCPT query encoder against a BiomedBERT article index = wrong
+    vector space → garbage results.
+  - BiomedBERT uses ONE shared encoder for both indexing and querying
+    (symmetric bi-encoder) — query and article vectors live in same space.
+  - Rule: query encoder MUST match the encoder used in dense_index.py.
 
-Output format is IDENTICAL to your old testset_inference.py so your
-Colab reranker and LLaMA-3 pipeline need zero changes.
+ARCHITECTURE:
+  - Query encoded with BiomedBERT-large, mean-pooled, L2-normalised
+  - Matches article vectors built by dense_index.py (same model, same pooling)
+  - Inner product in FAISS == cosine similarity (both sides L2-normalised)
+  - RRF merges BM25 ranks + dense ranks into final ranked list
+
+Output format is IDENTICAL to old testset_inference.py — Colab reranker
+and LLaMA-3 pipeline need ZERO changes.
 
 INSTALL:
-    pip install transformers faiss-cpu torch pyserini tqdm
+    pip install transformers faiss-cpu torch pyserini tqdm huggingface_hub
+
+    # GPU (optional, speeds up query encoding):
+    pip install torch --index-url https://download.pytorch.org/whl/cu121
 
 RUN (test set inference):
     python hybrid_search.py --mode test --testset 3
 
-RUN (training set — prints recall@10/100/1000 for self-evaluation):
+RUN (training — prints recall@10/100/1000 for self-evaluation):
     python hybrid_search.py --mode train
 
 FALLBACK (dense index not built yet):
@@ -33,6 +47,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# ── HuggingFace endpoint ───────────────────────────────────────────
+# hf-mirror.com does NOT host microsoft/BiomedNLP-* — use official endpoint
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+os.environ.setdefault("HUGGINGFACE_HUB_VERBOSITY",  "info")
+
 
 # ══════════════════════════════════════════════════════════════════ #
 #  CONFIGURE                                                        #
@@ -43,9 +62,9 @@ BASE_DIR     = r"C:\projects\BioASQ13B"
 # ── Your existing BM25 Pyserini index (unchanged) ─────────────────
 BM25_INDEX   = os.path.join(BASE_DIR, "data", "indexes", "pyserini_pubmed_full")
 
-# ── MedCPT dense index built by create_dense.py ───────────────────
-DENSE_DIR    = os.path.join(BASE_DIR, "data", "indexes", "dense_medcpt")
-FAISS_FILE   = os.path.join(DENSE_DIR, "medcpt.faiss")
+# ── BiomedBERT dense index built by dense_index.py ────────────────
+DENSE_DIR    = os.path.join(BASE_DIR, "data", "indexes", "dense_biomedbert")
+FAISS_FILE   = os.path.join(DENSE_DIR, "biomedbert.faiss")
 PMID_MAP     = os.path.join(DENSE_DIR, "pmid_map.json")
 
 # ── Queries ───────────────────────────────────────────────────────
@@ -60,7 +79,7 @@ BM25_TOP_K   = 1000    # BM25 candidates before RRF merge
 DENSE_TOP_K  = 1000    # dense candidates before RRF merge
 HYBRID_TOP_K = 1000    # final docs sent to Colab reranker
 
-# ── RRF constants — higher k = lower influence from that signal ───
+# ── RRF constants — tune these; higher k = weaker signal influence ─
 RRF_K_BM25   = 60
 RRF_K_DENSE  = 60
 
@@ -68,13 +87,12 @@ RRF_K_DENSE  = 60
 BM25_K1 = 0.6
 BM25_B  = 0.3
 
-# ── MedCPT query encoder ─────────────────────────────────────────
-# NOTE: article encoder (ncbi/MedCPT-Article-Encoder) is used in
-#       create_dense.py for indexing.
-#       Query encoder (ncbi/MedCPT-Query-Encoder) is used HERE for search.
-#       They are separate models but produce vectors in the same space.
-QUERY_MODEL  = "ncbi/MedCPT-Query-Encoder"
-QUERY_MAXLEN = 64      # queries are short — 64 tokens is enough
+# ── BiomedBERT query encoder ──────────────────────────────────────
+# CRITICAL: must be the same model used in dense_index.py for indexing.
+# Symmetric bi-encoder — one model encodes both queries and articles.
+QUERY_MODEL  = "microsoft/BiomedNLP-BiomedBERT-large-uncased-abstract"
+QUERY_MAXLEN = 512     # BiomedBERT max — use full window for queries too
+                       # (queries in BioASQ can be long clinical questions)
 
 # ══════════════════════════════════════════════════════════════════ #
 
@@ -85,26 +103,32 @@ QUERY_MAXLEN = 64      # queries are short — 64 tokens is enough
 
 def check_deps():
     missing = []
-    try:
-        import transformers  # noqa
-    except ImportError:
-        missing.append("transformers")
-    try:
-        import faiss  # noqa
-    except ImportError:
-        missing.append("faiss-cpu")
-    try:
-        import torch  # noqa
-    except ImportError:
-        missing.append("torch")
-    try:
-        from pyserini.search.lucene import LuceneSearcher  # noqa
-    except ImportError:
-        missing.append("pyserini")
+    for pkg, import_name in [
+        ("transformers",  "transformers"),
+        ("faiss-cpu",     "faiss"),
+        ("torch",         "torch"),
+        ("pyserini",      "pyserini"),
+        ("tqdm",          "tqdm"),
+    ]:
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pkg)
+
     if missing:
         print(f"[STOP] Missing packages: {', '.join(missing)}")
         print(f"       Run: pip install {' '.join(missing)}")
         sys.exit(1)
+
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"[OK] GPU detected : {name}  ({vram:.1f} GB VRAM)")
+    else:
+        print("[OK] No GPU — CPU mode (query encoding ~0.2s per query, fine for search)")
+
     print("[OK] All dependencies found.\n")
 
 
@@ -124,52 +148,110 @@ def load_bm25():
 
 
 # ────────────────────────────────────────────────────────────────── #
-#  LOAD DENSE INDEX (FAISS + MedCPT query encoder)                   #
+#  BIOMEDBERT QUERY ENCODER                                          #
+# ────────────────────────────────────────────────────────────────── #
+
+class BiomedBERTQueryEncoder:
+    """
+    Encodes BioASQ queries with BiomedBERT-large.
+
+    Uses IDENTICAL pooling + normalisation as dense_index.py:
+      - Mean pooling over last hidden state (mask-aware, padding excluded)
+      - L2 normalisation → inner product in FAISS == cosine similarity
+
+    This guarantees query and article vectors live in the same space.
+    Changing either pooling method or norm would silently break retrieval.
+    """
+
+    def __init__(self, model_name: str):
+        from transformers import AutoTokenizer, AutoModel
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        print(f"[INFO] Loading BiomedBERT tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        print(f"[INFO] Loading BiomedBERT model → {self.device}...")
+        self.model = AutoModel.from_pretrained(model_name)
+
+        # fp16 on GPU: halves VRAM, ~1.7x faster, negligible quality loss
+        if self.device.type == "cuda":
+            self.model = self.model.half()
+
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        print(f"[OK] BiomedBERT-large query encoder ready "
+              f"({'fp16 GPU' if self.device.type == 'cuda' else 'fp32 CPU'})\n")
+
+    def _mean_pool(self, last_hidden: torch.Tensor,
+                   attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Mask-aware mean pooling — identical to dense_index.py.
+        Padding tokens (attention_mask=0) do NOT contribute to mean.
+        """
+        mask_exp   = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
+        sum_hidden = torch.sum(last_hidden.float() * mask_exp, dim=1)
+        sum_mask   = torch.clamp(mask_exp.sum(dim=1), min=1e-9)
+        return sum_hidden / sum_mask
+
+    def encode(self, query_text: str) -> np.ndarray:
+        """
+        Encode a single query string → float32 numpy array [1 x 1024].
+        L2-normalised to unit norm (matches article vectors in FAISS index).
+        """
+        encoded = self.tokenizer(
+            [query_text],
+            padding        = True,
+            truncation     = True,
+            max_length     = QUERY_MAXLEN,
+            return_tensors = "pt",
+        )
+        encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
+        with torch.no_grad():
+            out  = self.model(**encoded)
+            vec  = self._mean_pool(out.last_hidden_state,
+                                   encoded["attention_mask"])
+            vec  = F.normalize(vec, p=2, dim=-1)
+
+        return vec.cpu().float().numpy().astype("float32")  # [1 x 1024]
+
+
+# ────────────────────────────────────────────────────────────────── #
+#  LOAD DENSE INDEX                                                  #
 # ────────────────────────────────────────────────────────────────── #
 
 def load_dense():
     """
-    Returns (faiss_index, pmid_list, tokenizer, model) or
-            (None, None, None, None) if index not built yet.
+    Returns (faiss_index, pmid_list, query_encoder) or
+            (None, None, None) if index not built yet.
     """
     import faiss
-    from transformers import AutoTokenizer, AutoModel
 
-    # Check required files exist
     missing = [f for f in [FAISS_FILE, PMID_MAP] if not os.path.exists(f)]
     if missing:
         print("\n[WARNING] Dense index files not found:")
         for f in missing:
             print(f"  Missing: {f}")
-        print("  Run create_dense.py first.")
+        print("  Run dense_index.py first to build the BiomedBERT index.")
         print("  Falling back to BM25-only mode.\n")
-        return None, None, None, None
+        return None, None, None
 
-    # Load FAISS index
-    print(f"[INFO] Loading FAISS index ...")
+    print(f"[INFO] Loading FAISS index...")
     t0    = time.time()
     index = faiss.read_index(FAISS_FILE)
-    index.nprobe = 64
+    index.nprobe = 64   # matches dense_index.py NPROBE
     print(f"       {index.ntotal:,} vectors  ({time.time()-t0:.1f}s)")
 
-    # Load PMID map
-    print(f"[INFO] Loading PMID map ...")
+    print(f"[INFO] Loading PMID map...")
     with open(PMID_MAP) as f:
         pmid_list = json.load(f)
     print(f"       {len(pmid_list):,} PMIDs mapped")
 
-    # Load MedCPT Query Encoder
-    # Uses AutoTokenizer + AutoModel (NOT SentenceTransformer or FlagEmbedding)
-    print(f"[INFO] Loading MedCPT Query Encoder ({QUERY_MODEL}) ...")
-    tokenizer = AutoTokenizer.from_pretrained(QUERY_MODEL)
-    model     = AutoModel.from_pretrained(QUERY_MODEL)
-    model.eval()
+    # Load BiomedBERT query encoder (same model as used for indexing)
+    encoder = BiomedBERTQueryEncoder(QUERY_MODEL)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = model.to(device)
-    print(f"[OK] Dense retrieval ready on {device}.\n")
-
-    return index, pmid_list, tokenizer, model
+    return index, pmid_list, encoder
 
 
 # ────────────────────────────────────────────────────────────────── #
@@ -220,37 +302,25 @@ def bm25_search(searcher, query_text: str) -> dict:
     return {hit.docid: rank for rank, hit in enumerate(hits, start=1)}
 
 
-def dense_search(faiss_index, pmid_list, tokenizer, model, query_text: str) -> dict:
+def dense_search(faiss_index, pmid_list: list,
+                 encoder: BiomedBERTQueryEncoder,
+                 query_text: str) -> dict:
     """
-    Encodes query with MedCPT-Query-Encoder and searches FAISS.
-    CLS token = query embedding, L2-normalised for cosine via inner product.
+    Encodes query with BiomedBERT (mean-pool, L2-norm) and searches FAISS.
+    Inner product against L2-normalised article vectors == cosine similarity.
     Returns {pmid: rank}.
     """
-    device = next(model.parameters()).device
-
-    with torch.no_grad():
-        encoded = tokenizer(
-            [query_text],
-            truncation     = True,
-            padding        = True,
-            return_tensors = "pt",
-            max_length     = QUERY_MAXLEN,
-        )
-        encoded = {k: v.to(device) for k, v in encoded.items()}
-
-        # CLS token ([0]) = query representation
-        vec = model(**encoded).last_hidden_state[:, 0, :]
-        vec = F.normalize(vec, p=2, dim=-1)
-        vec = vec.cpu().numpy().astype("float32")
-
+    vec = encoder.encode(query_text)                        # [1 x 1024]
     distances, indices = faiss_index.search(vec, DENSE_TOP_K)
-    return {pmid_list[idx]: rank
-            for rank, idx in enumerate(indices[0], start=1)
-            if idx != -1}
+    return {
+        pmid_list[idx]: rank
+        for rank, idx in enumerate(indices[0], start=1)
+        if idx != -1
+    }
 
 
 # ────────────────────────────────────────────────────────────────── #
-#  RRF MERGE — 2 signals (BM25 + MedCPT dense)                      #
+#  RRF MERGE — BM25 + BiomedBERT dense                              #
 # ────────────────────────────────────────────────────────────────── #
 
 def rrf_merge(bm25_ranks: dict, dense_ranks: dict) -> list:
@@ -258,6 +328,7 @@ def rrf_merge(bm25_ranks: dict, dense_ranks: dict) -> list:
     score(d) = 1/(k_bm25  + rank_bm25(d))
              + 1/(k_dense + rank_dense(d))
 
+    Documents only in one signal still get a score from that signal alone.
     Returns [(pmid, rrf_score)] sorted descending, length HYBRID_TOP_K.
     """
     all_pmids = set(bm25_ranks) | set(dense_ranks)
@@ -290,17 +361,18 @@ def get_contents(searcher, pmid: str) -> str:
 # ────────────────────────────────────────────────────────────────── #
 
 def run_hybrid(queries, bm25_searcher, faiss_index, pmid_list,
-               tokenizer, model, output_file, bm25_only=False):
+               encoder, output_file, bm25_only=False):
 
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
 
-    total  = len(queries)
-    t0_all = time.time()
+    total   = len(queries)
+    t0_all  = time.time()
     results = {}
 
-    signals = "BM25 only" if bm25_only else "BM25 + MedCPT dense  →  RRF"
+    signals = "BM25 only" if bm25_only else "BM25 + BiomedBERT dense  →  RRF"
     print(f"Signals : {signals}")
     print(f"Top-k   : BM25={BM25_TOP_K}  Dense={DENSE_TOP_K}  Out={HYBRID_TOP_K}")
+    print(f"RRF k   : BM25={RRF_K_BM25}  Dense={RRF_K_DENSE}")
     print(f"Output  : {output_file}\n")
 
     with open(output_file, "w", encoding="utf-8") as out_f:
@@ -313,9 +385,9 @@ def run_hybrid(queries, bm25_searcher, faiss_index, pmid_list,
             dense_ranks = {}
 
             if not bm25_only and faiss_index is not None:
-                # ── Signal 2: MedCPT dense ────────────────────────
+                # ── Signal 2: BiomedBERT dense ────────────────────
                 dense_ranks = dense_search(
-                    faiss_index, pmid_list, tokenizer, model, query_txt
+                    faiss_index, pmid_list, encoder, query_txt
                 )
                 ranked = rrf_merge(bm25_ranks, dense_ranks)
             else:
@@ -334,10 +406,10 @@ def run_hybrid(queries, bm25_searcher, faiss_index, pmid_list,
                 for pmid, score in ranked
             ]
 
-            # Key kept as "bm25" — your Colab reranker reads this key
+            # Key kept as "bm25" — Colab reranker reads this key unchanged
             out = {"id": qid, "query_text": query_txt, "bm25": docs}
             out_f.write(json.dumps(out) + "\n")
-            out_f.flush()   # crash-safe — written after every query
+            out_f.flush()   # crash-safe — flushed after every query
             results[qid] = docs
 
             if i % 10 == 0 or i == total:
@@ -365,7 +437,7 @@ def evaluate(results: dict, qrels_dict: dict):
             gold = qrels_dict.get(qid, set())
             if not gold:
                 continue
-            hits = set(d["id"] for d in docs[:k]) & gold
+            hits = {d["id"] for d in docs[:k]} & gold
             vals.append(len(hits) / len(gold))
         if vals:
             print(f"  recall@{k:<6} {sum(vals)/len(vals):.4f}  "
@@ -382,16 +454,17 @@ def main():
     parser.add_argument("--mode",      choices=["train", "test"], default="test")
     parser.add_argument("--testset",   type=int, default=3)
     parser.add_argument("--bm25_only", action="store_true",
-                        help="BM25 only — use while dense index is building")
+                        help="BM25 only — use while dense index is still building")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  HYBRID RETRIEVAL — BM25 + MedCPT Dense + RRF")
-    print(f"  Mode       : {args.mode}")
-    print(f"  Top-k      : BM25={BM25_TOP_K}  Dense={DENSE_TOP_K}"
+    print("  HYBRID RETRIEVAL — BM25 + BiomedBERT-large Dense + RRF")
+    print(f"  Dense model : {QUERY_MODEL}")
+    print(f"  Mode        : {args.mode}")
+    print(f"  Top-k       : BM25={BM25_TOP_K}  Dense={DENSE_TOP_K}"
           f"  →  out={HYBRID_TOP_K}")
-    print(f"  RRF k      : BM25={RRF_K_BM25}  Dense={RRF_K_DENSE}")
-    print(f"  BM25-only  : {args.bm25_only}")
+    print(f"  RRF k       : BM25={RRF_K_BM25}  Dense={RRF_K_DENSE}")
+    print(f"  BM25-only   : {args.bm25_only}")
     print("=" * 60 + "\n")
 
     check_deps()
@@ -399,11 +472,11 @@ def main():
     # ── Load BM25 ────────────────────────────────────────────────
     bm25_searcher = load_bm25()
 
-    # ── Load dense index ─────────────────────────────────────────
-    faiss_index = pmid_list = tokenizer = model = None
+    # ── Load dense index + BiomedBERT query encoder ──────────────
+    faiss_index = pmid_list = encoder = None
 
     if not args.bm25_only:
-        faiss_index, pmid_list, tokenizer, model = load_dense()
+        faiss_index, pmid_list, encoder = load_dense()
         if faiss_index is None:
             print("[INFO] Falling back to BM25-only.\n")
             args.bm25_only = True
@@ -414,7 +487,7 @@ def main():
         output_file = os.path.join(RESULTS_DIR, "hybrid_train_results.jsonl")
     else:
         query_file  = TEST_PATTERN.format(args.testset)
-        tag         = "BM25only" if args.bm25_only else "hybrid_medcpt"
+        tag         = "BM25only" if args.bm25_only else "hybrid_biomedbert"
         output_file = os.path.join(
             RESULTS_DIR,
             f"{HYBRID_TOP_K}_BioASQ14b_testset{args.testset}_{tag}_results.jsonl"
@@ -428,8 +501,7 @@ def main():
         bm25_searcher = bm25_searcher,
         faiss_index   = faiss_index,
         pmid_list     = pmid_list,
-        tokenizer     = tokenizer,
-        model         = model,
+        encoder       = encoder,
         output_file   = output_file,
         bm25_only     = args.bm25_only,
     )

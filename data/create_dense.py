@@ -1,16 +1,26 @@
 """
 dense_index.py
 --------------
-Builds dense + sparse vectors over 38M PubMed articles using BGE-M3.
+Builds dense vectors over 38M PubMed articles using
+microsoft/BiomedNLP-BiomedBERT-large-uncased-abstract
 
-- CPU-only safe (but will use GPU if available)
-- Resume-safe: shutdown mid-run → re-run → picks up exactly where it left off
-- Encodes in chunks of 100,000 articles to stay within RAM limits
-- Saves dense vectors as .npy and sparse vectors as .json per chunk
-- Builds FAISS IVFFlat index after all chunks are encoded
+WHY BiomedBERT over BGE-M3?
+  - Trained from scratch on PubMed + PMC full text (no general web data)
+  - Understands MeSH terms, gene names, drug names natively
+  - Consistently outperforms general models on BioASQ benchmarks
+  - Large variant (1024-dim) matches BGE-M3 dimensionality → FAISS config unchanged
+
+ARCHITECTURE:
+  - Mean-pooling over last hidden state  → dense vector [1024]
+  - Vectors L2-normalised for cosine/IP search
+  - FAISS IVFFlat with Inner Product metric (equivalent to cosine after normalisation)
+  - No sparse output (BiomedBERT is encoder-only; add BM25 separately if needed)
 
 INSTALL:
-    pip install "FlagEmbedding==1.2.11" "transformers>=4.44.2,<5.0.0" faiss-cpu tqdm
+    pip install torch transformers faiss-cpu tqdm huggingface_hub
+
+    # GPU (optional but 10-15x faster):
+    pip install torch --index-url https://download.pytorch.org/whl/cu121
 
 RUN:
     python dense_index.py
@@ -18,20 +28,19 @@ RUN:
 RESUME (after shutdown):
     python dense_index.py        ← same command, auto-detects progress
 
-EXPECTED TIME (CPU-only):
-    Encoding   : ~20-28 hours for 38M articles (run overnight)
-    FAISS build: ~1-2 hours after all chunks done
+EXPECTED TIME:
+    CPU-only  : ~30-40 hours for 38M articles
+    GPU A100  : ~3-4 hours
+    GPU RTX3090: ~8-10 hours
 
 OUTPUT:
-    data\\indexes\\dense_bgem3\\
+    data\\indexes\\dense_biomedbert\\
         chunks\\
             chunk_00000_dense.npy       dense vectors  [N x 1024]
-            chunk_00000_sparse.json     sparse weights [{token_id: weight}]
             chunk_00000_pmids.json      PMIDs in chunk order
             ...
-        bgem3.faiss                     final FAISS index (~35-40GB)
+        biomedbert.faiss                final FAISS index (~38-42GB)
         pmid_map.json                   global position → PMID
-        sparse_index.json               global PMID → sparse weights (~6-8GB)
         encode_progress.log             resume log  ← DO NOT DELETE mid-run
 """
 
@@ -44,39 +53,44 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
-# ── HuggingFace download optimizations ────────────────────────────
-# Mirror is much faster than official HF servers from Asia/Pakistan
-os.environ.setdefault("HF_ENDPOINT",            "https://hf-mirror.com")
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")   # disable parallel downloads (causes stalls)
-os.environ.setdefault("HUGGINGFACE_HUB_VERBOSITY",  "info") # show download progress clearly
+# ── HuggingFace endpoint ───────────────────────────────────────────
+# NOTE: hf-mirror.com does NOT host microsoft/BiomedNLP-* models.
+#       We use the official endpoint. Download is ~1.3 GB, one-time only.
+#       If huggingface.co is slow, try setting manually:
+#         set HF_ENDPOINT=https://hf-mirror.com   ← only if model appears there
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+os.environ.setdefault("HUGGINGFACE_HUB_VERBOSITY",  "info")
 
 
 # ══════════════════════════════════════════════════════════════════ #
 #  CONFIGURE                                                        #
 # ══════════════════════════════════════════════════════════════════ #
 
-BASE_DIR     = r"C:\projects\BioASQ13B"
+BASE_DIR   = r"C:\projects\BioASQ13B"
 
-JSONL_FILE   = os.path.join(BASE_DIR, "data", "full_input", "pubmed_collection.jsonl")
+JSONL_FILE = os.path.join(BASE_DIR, "data", "full_input", "pubmed_collection.jsonl")
 
-DENSE_DIR    = os.path.join(BASE_DIR, "data", "indexes", "dense_bgem3")
-CHUNK_DIR    = os.path.join(DENSE_DIR, "chunks")
-FAISS_FILE   = os.path.join(DENSE_DIR, "bgem3.faiss")
-PMID_MAP     = os.path.join(DENSE_DIR, "pmid_map.json")
-SPARSE_INDEX = os.path.join(DENSE_DIR, "sparse_index.json")
+DENSE_DIR  = os.path.join(BASE_DIR, "data", "indexes", "dense_biomedbert")
+CHUNK_DIR  = os.path.join(DENSE_DIR, "chunks")
+FAISS_FILE = os.path.join(DENSE_DIR, "biomedbert.faiss")
+PMID_MAP   = os.path.join(DENSE_DIR, "pmid_map.json")
 PROGRESS_LOG = os.path.join(DENSE_DIR, "encode_progress.log")
 
+# ── Model ─────────────────────────────────────────────────────────
+# CORRECT name — the large variant only exists in abstract (not abstract-fulltext)
+# abstract-fulltext exists only for the BASE (768-dim) model, NOT large.
+# large-uncased-abstract = BERT-large architecture, 1024-dim, PubMed abstracts
+MODEL_NAME = "microsoft/BiomedNLP-BiomedBERT-large-uncased-abstract"
+
 # ── Encoding ──────────────────────────────────────────────────────
-CHUNK_SIZE   = 100_000   # articles per chunk — lower to 50_000 if RAM errors
-BATCH_SIZE   = 32        # per-batch encoder size
-MAX_LENGTH   = 256       # token limit (256 good for title+abstract)
+CHUNK_SIZE  = 100_000   # articles per chunk — lower to 50_000 if OOM
+BATCH_SIZE  = 32        # reduce to 16 on CPU or low-VRAM GPU
+MAX_LENGTH  = 512       # BiomedBERT max is 512 tokens (use full window)
 
 # ── FAISS IVF ─────────────────────────────────────────────────────
-DIM          = 1024      # BGE-M3 dense dimension
-NLIST        = 8192      # Voronoi cells — sqrt(38M) ≈ 6164, rounded up
-NPROBE       = 64        # cells to search per query
-
-MODEL_NAME   = "BAAI/bge-m3"
+DIM    = 1024    # BiomedBERT-large hidden size
+NLIST  = 8192    # Voronoi cells (~sqrt(38M))
+NPROBE = 64      # cells searched per query (increase for higher recall)
 
 # ══════════════════════════════════════════════════════════════════ #
 
@@ -87,54 +101,33 @@ MODEL_NAME   = "BAAI/bge-m3"
 
 def check_deps():
     missing = []
-    broken  = []
 
-    # Check FlagEmbedding — catch both ImportError and sub-import errors
-    try:
-        import importlib.util
-        spec = importlib.util.find_spec("FlagEmbedding")
-        if spec is None:
-            missing.append("FlagEmbedding==1.2.11")
-        else:
-            # Try the actual import to catch version-conflict errors
-            try:
-                from FlagEmbedding import BGEM3FlagModel  # noqa
-            except ImportError as e:
-                err = str(e)
-                if "is_flash_attn_greater_or_equal_2_10" in err or \
-                   "cannot import name" in err:
-                    broken.append(
-                        "FlagEmbedding/transformers version conflict.\n"
-                        '       Fix: pip install "FlagEmbedding==1.2.11" '
-                        '"transformers>=4.44.2,<5.0.0"'
-                    )
-                else:
-                    broken.append(f"FlagEmbedding import error: {err}")
-    except Exception as e:
-        missing.append("FlagEmbedding==1.2.11")
-
-    # Check faiss
-    try:
-        import faiss  # noqa
-    except ImportError:
-        missing.append("faiss-cpu")
-
-    # Check tqdm
-    try:
-        import tqdm  # noqa
-    except ImportError:
-        missing.append("tqdm")
+    for pkg, import_name in [
+        ("torch",            "torch"),
+        ("transformers",     "transformers"),
+        ("faiss-cpu",        "faiss"),
+        ("tqdm",             "tqdm"),
+        ("huggingface_hub",  "huggingface_hub"),
+    ]:
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pkg)
 
     if missing:
         print(f"[STOP] Missing packages: {', '.join(missing)}")
         print(f"       Run: pip install {' '.join(missing)}")
         sys.exit(1)
 
-    if broken:
-        print("[STOP] Broken dependencies detected:")
-        for b in broken:
-            print(f"       {b}")
-        sys.exit(1)
+    # Report torch device
+    import torch
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"[OK] GPU detected : {name}  ({vram:.1f} GB VRAM)")
+        print(f"     Batch size   : {BATCH_SIZE}  (increase if VRAM > 16GB)")
+    else:
+        print("[OK] No GPU — running on CPU (expect ~30-40h for 38M articles)")
 
     print("[OK] All dependencies found.\n")
 
@@ -145,14 +138,14 @@ def check_deps():
 
 def check_disk():
     import shutil
-    free_gb = shutil.disk_usage(BASE_DIR).free / (1024 ** 3)
-    needed  = 55.0   # chunks ~5GB + FAISS ~38GB + sparse ~8GB + pmid map ~1GB
+    free_gb = shutil.disk_usage(BASE_DIR).free / 1024**3
+    # chunks ~5GB + FAISS ~38GB + pmid_map ~1GB = ~44GB
+    needed  = 44.0
     print(f"[INFO] Free disk : {free_gb:.1f} GB")
     print(f"[INFO] Needed    : ~{needed:.0f} GB")
     if free_gb < needed:
         print(f"\n[STOP] Not enough disk space.")
         print(f"       Free up at least {needed:.0f} GB and re-run.")
-        print(f"       Tip: delete pubmed_xmls\\ (~50GB) if not already done.")
         sys.exit(1)
     print(f"[OK] Enough disk space.\n")
 
@@ -168,12 +161,13 @@ def load_progress() -> set:
     with open(PROGRESS_LOG, "r") as f:
         done = {int(l.strip()) for l in f if l.strip().isdigit()}
     if done:
-        print(f"[RESUME] {len(done)} chunk(s) already done — resuming from chunk {max(done)+1}.\n")
+        print(f"[RESUME] {len(done)} chunk(s) already done — "
+              f"resuming from chunk {max(done)+1}.\n")
     return done
 
 
 def mark_chunk_done(chunk_idx: int):
-    """Written AFTER all chunk files are safely saved — crash before = retry."""
+    """Appended AFTER all chunk files are safely written — crash before = retry."""
     with open(PROGRESS_LOG, "a") as f:
         f.write(f"{chunk_idx}\n")
 
@@ -184,8 +178,8 @@ def mark_chunk_done(chunk_idx: int):
 
 def stream_articles(path: str, skip: int = 0):
     """
-    Yields (pmid, text) from your pubmed_collection.jsonl.
-    Format: {"id": "12345678", "contents": "title abstract mesh ..."}
+    Yields (pmid, text) from pubmed_collection.jsonl.
+    Format: {"id": "12345678", "contents": "title abstract ..."}
     Skips first `skip` lines for resume.
     """
     with open(path, "r", encoding="utf-8") as f:
@@ -214,6 +208,88 @@ def count_lines(path: str) -> int:
 
 
 # ────────────────────────────────────────────────────────────────── #
+#  BIOMEDBERT ENCODER                                                #
+# ────────────────────────────────────────────────────────────────── #
+
+class BiomedBERTEncoder:
+    """
+    Wraps BiomedBERT-large for batched mean-pool encoding.
+
+    Mean pooling over the last hidden state (ignoring padding tokens)
+    is standard practice for bi-encoder dense retrieval with BERT-family
+    models and outperforms CLS-only pooling on passage retrieval tasks.
+
+    Vectors are L2-normalised so that inner product == cosine similarity,
+    matching FAISS IndexIVFFlat with METRIC_INNER_PRODUCT.
+    """
+
+    def __init__(self, model_name: str, device: str = None):
+        import torch
+        from transformers import AutoTokenizer, AutoModel
+
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[INFO] Loading tokenizer: {model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        print(f"[INFO] Loading model    : {model_name}")
+        print(f"[INFO] Device           : {self.device}")
+        self.model = AutoModel.from_pretrained(model_name)
+
+        # fp16 on GPU → halves VRAM and speeds up ~1.7x with negligible quality loss
+        if self.device == "cuda":
+            self.model = self.model.half()
+
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        print(f"[OK] BiomedBERT-large loaded "
+              f"({'fp16 GPU' if self.device == 'cuda' else 'fp32 CPU'})\n")
+
+    @staticmethod
+    def _mean_pool(last_hidden: "torch.Tensor",
+                   attention_mask: "torch.Tensor") -> "torch.Tensor":
+        """Mask-aware mean pooling — padding tokens do not contribute."""
+        import torch
+        mask_exp = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
+        sum_hidden = torch.sum(last_hidden.float() * mask_exp, dim=1)
+        sum_mask   = torch.clamp(mask_exp.sum(dim=1), min=1e-9)
+        return sum_hidden / sum_mask
+
+    def encode(self, texts: list[str], batch_size: int = 32,
+               max_length: int = 512) -> np.ndarray:
+        """
+        Encode a list of strings → float32 numpy array [N x 1024].
+        Vectors are L2-normalised (unit norm).
+        """
+        import torch
+
+        all_vecs = []
+
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start : start + batch_size]
+
+            encoded = self.tokenizer(
+                batch,
+                padding       = True,
+                truncation    = True,
+                max_length    = max_length,
+                return_tensors= "pt",
+            ).to(self.device)
+
+            with torch.no_grad():
+                out = self.model(**encoded)
+
+            vecs = self._mean_pool(out.last_hidden_state,
+                                   encoded["attention_mask"])
+
+            # L2 normalise
+            vecs = torch.nn.functional.normalize(vecs, p=2, dim=1)
+
+            all_vecs.append(vecs.cpu().float().numpy())
+
+        return np.vstack(all_vecs).astype("float32")
+
+
+# ────────────────────────────────────────────────────────────────── #
 #  STEP 1 — ENCODE ALL CHUNKS                                        #
 # ────────────────────────────────────────────────────────────────── #
 
@@ -221,13 +297,9 @@ def encode_all_chunks(total: int, done_chunks: set) -> list:
     """
     Streams JSONL, encodes in chunks, saves per chunk:
         chunk_XXXXX_dense.npy    float32 [N x 1024]
-        chunk_XXXXX_sparse.json  [{token_id: weight}, ...]
         chunk_XXXXX_pmids.json   [pmid, ...]
     Returns ordered list of all PMIDs.
     """
-    # Deferred import — only runs after check_deps() has verified it works
-    from FlagEmbedding import BGEM3FlagModel
-
     os.makedirs(CHUNK_DIR, exist_ok=True)
 
     n_chunks   = math.ceil(total / CHUNK_SIZE)
@@ -243,21 +315,20 @@ def encode_all_chunks(total: int, done_chunks: set) -> list:
         else:
             print(f"[WARNING] Chunk {ci} marked done but pmids file missing: {pf}")
 
-    print(f"Loading BGE-M3 model — downloading pytorch weights only (~2.3GB, ONNX skipped)...")
+    # Download model from official HuggingFace (hf-mirror does not host this model)
+    print(f"Downloading BiomedBERT-large (~1.3 GB from huggingface.co)...")
     from huggingface_hub import snapshot_download
-    local_model_dir = snapshot_download(
-        repo_id         = MODEL_NAME,
-        ignore_patterns = ["*.onnx", "*.onnx_data", "onnx/*"],  # skip 2.27GB ONNX file
-    )
-    model = BGEM3FlagModel(local_model_dir, use_fp16=True)
-    print(f"[OK] Model loaded.\n")
+    local_model_dir = snapshot_download(repo_id=MODEL_NAME)
+
+    encoder = BiomedBERTEncoder(local_model_dir)
 
     remaining = n_chunks - len(done_chunks)
     print(f"Chunks total    : {n_chunks}")
     print(f"Already done    : {len(done_chunks)}")
     print(f"To encode now   : {remaining}")
-    est_h = max(0, (total - skip_lines)) / 900 / 3600
-    print(f"Est. time       : ~{est_h:.1f}h on CPU  (runs fine overnight)\n")
+    est_h = max(0, total - skip_lines) / 700 / 3600   # ~700 art/s on CPU
+    print(f"Est. time       : ~{est_h:.1f}h on CPU  "
+          f"(GPU will be ~10-15x faster)\n")
 
     text_buffer = []
     pmid_buffer = []
@@ -272,18 +343,20 @@ def encode_all_chunks(total: int, done_chunks: set) -> list:
             pmid_buffer.append(pmid)
 
             if len(text_buffer) >= CHUNK_SIZE:
-                _encode_and_save(model, text_buffer, pmid_buffer,
-                                 chunk_idx, n_chunks, all_pmids, t_global)
+                _encode_and_save(encoder, text_buffer, pmid_buffer,
+                                 chunk_idx, n_chunks, total,
+                                 all_pmids, t_global)
                 mark_chunk_done(chunk_idx)
                 pbar.update(len(text_buffer))
-                chunk_idx   += 1
-                text_buffer  = []
-                pmid_buffer  = []
+                chunk_idx  += 1
+                text_buffer = []
+                pmid_buffer = []
 
         # Final partial chunk
         if text_buffer:
-            _encode_and_save(model, text_buffer, pmid_buffer,
-                             chunk_idx, n_chunks, all_pmids, t_global)
+            _encode_and_save(encoder, text_buffer, pmid_buffer,
+                             chunk_idx, n_chunks, total,
+                             all_pmids, t_global)
             mark_chunk_done(chunk_idx)
             pbar.update(len(text_buffer))
 
@@ -291,38 +364,21 @@ def encode_all_chunks(total: int, done_chunks: set) -> list:
     return all_pmids
 
 
-def _encode_and_save(model, texts, pmids, chunk_idx,
-                     n_chunks, all_pmids_out, t_global):
-    """Encode one chunk and write all three output files atomically."""
-    dense_file  = os.path.join(CHUNK_DIR, f"chunk_{chunk_idx:05d}_dense.npy")
-    sparse_file = os.path.join(CHUNK_DIR, f"chunk_{chunk_idx:05d}_sparse.json")
-    pmid_file   = os.path.join(CHUNK_DIR, f"chunk_{chunk_idx:05d}_pmids.json")
+def _encode_and_save(encoder: "BiomedBERTEncoder",
+                     texts: list, pmids: list,
+                     chunk_idx: int, n_chunks: int, total: int,
+                     all_pmids_out: list, t_global: float):
+    """Encode one chunk and write output files atomically."""
+    dense_file = os.path.join(CHUNK_DIR, f"chunk_{chunk_idx:05d}_dense.npy")
+    pmid_file  = os.path.join(CHUNK_DIR, f"chunk_{chunk_idx:05d}_pmids.json")
 
     t0 = time.time()
     print(f"\n── Chunk {chunk_idx+1:>4}/{n_chunks}  ({len(texts):,} articles)", flush=True)
 
-    output = model.encode(
-        texts,
-        return_dense        = True,
-        return_sparse       = True,
-        return_colbert_vecs = False,   # ColBERT needs GPU + huge storage, skip
-        batch_size          = BATCH_SIZE,
-        max_length          = MAX_LENGTH,
-    )
-
-    # Dense — float32 numpy array [N x 1024]
-    dense_vecs = output["dense_vecs"].astype("float32")
+    # Encode → float32 numpy [N x 1024], L2-normalised
+    dense_vecs = encoder.encode(texts, batch_size=BATCH_SIZE, max_length=MAX_LENGTH)
     np.save(dense_file, dense_vecs)
 
-    # Sparse — list of {token_id_str: float_weight} (only non-zero weights)
-    sparse_list = [
-        {str(k): float(v) for k, v in doc.items()}
-        for doc in output["lexical_weights"]
-    ]
-    with open(sparse_file, "w") as f:
-        json.dump(sparse_list, f)
-
-    # PMIDs — preserves chunk order for FAISS position mapping
     with open(pmid_file, "w") as f:
         json.dump(pmids, f)
 
@@ -332,11 +388,12 @@ def _encode_and_save(model, texts, pmids, chunk_idx,
     elapsed       = time.time() - t0
     total_elapsed = time.time() - t_global
     speed         = len(all_pmids_out) / total_elapsed if total_elapsed > 0 else 1
-    eta_h         = max(0, 38_000_000 - len(all_pmids_out)) / speed / 3600
+    eta_h         = max(0, total - len(all_pmids_out)) / speed / 3600  # uses real total
 
-    print(f"   Dense  : {os.path.getsize(dense_file)  / 1024**2:.0f} MB")
-    print(f"   Sparse : {os.path.getsize(sparse_file) / 1024**2:.0f} MB")
-    print(f"   Time   : {elapsed:.0f}s  |  Speed: {speed:.0f} art/s  |  ETA: ~{eta_h:.1f}h")
+    print(f"   Dense  : {os.path.getsize(dense_file) / 1024**2:.0f} MB  "
+          f"| shape {dense_vecs.shape}")
+    print(f"   Time   : {elapsed:.0f}s  |  Speed: {speed:.0f} art/s  "
+          f"|  ETA: ~{eta_h:.1f}h")
 
 
 # ────────────────────────────────────────────────────────────────── #
@@ -356,13 +413,16 @@ def build_faiss_index(all_pmids: list):
     print(f"  DIM={DIM}  NLIST={NLIST}  NPROBE={NPROBE}")
     print("=" * 60 + "\n")
 
-    # Train on first 2 chunks (~200K vectors is plenty for 8192 clusters)
+    # Train on first 2 chunks (~200K vectors — plenty for 8192 clusters)
     print("Loading training sample (first 2 chunks)...")
     sample = np.vstack([np.load(cf) for cf in chunk_files[:2]]).astype("float32")
     print(f"  {len(sample):,} vectors loaded for training\n")
 
     quantizer = faiss.IndexFlatIP(DIM)
     index     = faiss.IndexIVFFlat(quantizer, DIM, NLIST, faiss.METRIC_INNER_PRODUCT)
+
+    # Use all CPU threads for training
+    faiss.omp_set_num_threads(os.cpu_count())
 
     print("Training IVF quantizer (k-means) — ~10-30 min on CPU...")
     t0 = time.time()
@@ -393,88 +453,44 @@ def build_faiss_index(all_pmids: list):
 
 
 # ────────────────────────────────────────────────────────────────── #
-#  STEP 3 — MERGE SPARSE INDEX                                       #
-# ────────────────────────────────────────────────────────────────── #
-
-def build_sparse_index():
-    """
-    Merges per-chunk sparse files into one global file:
-        { "pmid": {"token_id": weight, ...}, ... }
-    Written incrementally so it never loads everything into RAM.
-    """
-    pmid_files   = sorted(Path(CHUNK_DIR).glob("chunk_*_pmids.json"))
-    sparse_files = sorted(Path(CHUNK_DIR).glob("chunk_*_sparse.json"))
-
-    if not pmid_files:
-        print("[WARNING] No sparse chunk files found — skipping merge.")
-        return
-
-    print(f"Merging {len(sparse_files)} sparse chunk(s) → {SPARSE_INDEX}")
-    print(f"  (~20-30 min for 38M articles, written incrementally)\n")
-
-    t0 = time.time()
-    with open(SPARSE_INDEX, "w", encoding="utf-8") as out:
-        out.write("{")
-        first = True
-        for pf, sf in tqdm(zip(pmid_files, sparse_files),
-                           total=len(pmid_files), desc="Merging sparse", unit="chunk"):
-            with open(pf) as f: pmids   = json.load(f)
-            with open(sf) as f: weights = json.load(f)
-            for pmid, w in zip(pmids, weights):
-                if not first:
-                    out.write(",")
-                out.write(f'"{pmid}":{json.dumps(w)}')
-                first = False
-        out.write("}")
-
-    gb = os.path.getsize(SPARSE_INDEX) / 1024**3
-    print(f"[OK] Sparse index saved — {gb:.1f} GB  ({(time.time()-t0)/60:.1f} min)\n")
-
-
-# ────────────────────────────────────────────────────────────────── #
-#  STEP 4 — SANITY CHECK                                             #
+#  STEP 3 — SANITY CHECK                                             #
 # ────────────────────────────────────────────────────────────────── #
 
 def sanity_check():
     import faiss
-    from FlagEmbedding import BGEM3FlagModel
 
     print("=" * 60)
-    print("Sanity check — 3 test queries against the built index...")
+    print("Sanity check — 3 biomedical test queries...")
     print("=" * 60 + "\n")
 
     index = faiss.read_index(FAISS_FILE)
     index.nprobe = NPROBE
+
     with open(PMID_MAP) as f:
         pmid_list = json.load(f)
 
     from huggingface_hub import snapshot_download
-    local_model_dir = snapshot_download(
-        repo_id         = MODEL_NAME,
-        ignore_patterns = ["*.onnx", "*.onnx_data", "onnx/*"],
-    )
-    model = BGEM3FlagModel(local_model_dir, use_fp16=True)
+    local_model_dir = snapshot_download(repo_id=MODEL_NAME)
+    encoder = BiomedBERTEncoder(local_model_dir)
 
     test_queries = [
-        "diabetes insulin resistance treatment",
-        "COVID-19 antiviral therapy",
-        "BRCA1 mutation breast cancer risk",
+        "diabetes insulin resistance treatment metformin",
+        "COVID-19 antiviral therapy remdesivir",
+        "BRCA1 mutation breast cancer risk hereditary",
     ]
 
-    print(f"  Index: {index.ntotal:,} vectors\n")
+    print(f"  Index : {index.ntotal:,} vectors\n")
+
     for query in test_queries:
-        out  = model.encode([query], return_dense=True,
-                            return_sparse=False, return_colbert_vecs=False)
-        vec  = np.array(out["dense_vecs"], dtype="float32")
-        dists, idxs = index.search(vec, 5)
+        vec             = encoder.encode([query])           # [1 x 1024]
+        dists, idxs     = index.search(vec, 5)
         print(f"  Query: '{query}'")
         for rank, (idx, dist) in enumerate(zip(idxs[0], dists[0]), 1):
             if idx != -1:
-                print(f"    [{rank}] PMID={pmid_list[idx]}  score={dist:.4f}")
+                print(f"    [{rank}] PMID={pmid_list[idx]}  cosine={dist:.4f}")
         print()
 
-    print("[OK] Sanity check passed — dense index is ready!")
-    print("     Run hybrid_search.py without --bm25_only to use it.\n")
+    print("[OK] Sanity check passed — BiomedBERT dense index is ready!\n")
 
 
 # ────────────────────────────────────────────────────────────────── #
@@ -483,11 +499,13 @@ def sanity_check():
 
 def main():
     print("=" * 60)
-    print("  DENSE INDEX BUILDER — BGE-M3 + FAISS")
+    print("  DENSE INDEX BUILDER — BiomedBERT-large + FAISS")
+    print(f"  Model  : {MODEL_NAME}")
     print(f"  Input  : {JSONL_FILE}")
     print(f"  Output : {DENSE_DIR}")
-    print(f"  Chunk  : {CHUNK_SIZE:,}  |  Batch: {BATCH_SIZE}  |  MaxLen: {MAX_LENGTH}")
-    print(f"  Dense  : YES (dim={DIM})  |  Sparse: YES")
+    print(f"  Chunk  : {CHUNK_SIZE:,}  |  Batch: {BATCH_SIZE}  "
+          f"|  MaxLen: {MAX_LENGTH}")
+    print(f"  Dense  : YES (dim={DIM}, L2-normalised)")
     print("=" * 60 + "\n")
 
     check_deps()
@@ -530,27 +548,20 @@ def main():
     else:
         build_faiss_index(all_pmids)
 
-    # ── STEP 3: Sparse index ──────────────────────────────────────
-    if os.path.exists(SPARSE_INDEX):
-        gb = os.path.getsize(SPARSE_INDEX) / 1024**3
-        print(f"[INFO] Sparse index already exists ({gb:.1f} GB) — skipping.")
-        print(f"       Delete {SPARSE_INDEX} to rebuild.\n")
-    else:
-        build_sparse_index()
-
-    # ── STEP 4: Sanity check ──────────────────────────────────────
+    # ── STEP 3: Sanity check ──────────────────────────────────────
     sanity_check()
 
     print("=" * 60)
     print("  ALL DONE")
-    print(f"  FAISS index  : {FAISS_FILE}")
-    print(f"  Sparse index : {SPARSE_INDEX}")
-    print(f"  PMID map     : {PMID_MAP}")
+    print(f"  FAISS index : {FAISS_FILE}")
+    print(f"  PMID map    : {PMID_MAP}")
     print()
-    print("  Next: run hybrid_search.py without --bm25_only")
+    print("  Next steps:")
+    print("  1. Add BM25 (sparse) separately with Pyserini or Elasticsearch")
+    print("  2. Hybrid re-rank: dense_score * 0.6 + bm25_score * 0.4")
+    print("  3. Run hybrid_search.py")
     print("=" * 60)
 
 
 if __name__ == "__main__":
     main()
-
